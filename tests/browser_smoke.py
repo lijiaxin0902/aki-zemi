@@ -38,13 +38,22 @@ def action(page, action_id):
     )
 
 
-def assert_layout(page, name, width, height=1100):
+def show_tab(page, label):
+    """Navigation must change visible content without changing the saved game."""
+    before = saved(page)
+    page.get_by_role("button", name=label, exact=True).click()
+    assert saved(page) == before, f"Switching the {label} tab changed game data"
+
+
+def assert_layout(page, name, width, height=None):
+    if height is None:
+        height = 844 if width <= 430 else 1100
     page.set_viewport_size({"width": width, "height": height})
     page.wait_for_timeout(80)
     measurements = page.evaluate("""() => ({
       width: window.innerWidth, body: document.body.scrollWidth,
       document: document.documentElement.scrollWidth,
-      outside: [...document.querySelectorAll('button,input,textarea,.panel,.action-card,.dream-card')]
+      outside: [...document.querySelectorAll('button,input,textarea,.ls-panel,.ls-profile,.ls-control-bar,.ls-tabs,.action-card,.dream-card')]
         .filter(el => { const r = el.getBoundingClientRect(); return r.width && (r.left < -1 || r.right > innerWidth + 1); })
         .map(el => ({tag: el.tagName, class: el.className, text: el.textContent.slice(0, 50)}))
     })""")
@@ -52,6 +61,18 @@ def assert_layout(page, name, width, height=1100):
     assert measurements["body"] <= width + 1, (name, measurements)
     assert measurements["document"] <= width + 1, (name, measurements)
     assert not measurements["outside"], (name, measurements["outside"])
+
+
+def assert_uncovered(locator):
+    locator.evaluate("element => element.scrollIntoView({block: 'center', behavior: 'instant'})")
+    measurement = locator.evaluate("""element => {
+      const rect = element.getBoundingClientRect();
+      const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+      const hit = document.elementFromPoint(x, y);
+      return {visible: y >= 0 && y < innerHeight && !!hit && (hit === element || element.contains(hit)),
+        target: element.textContent.slice(0, 50), hit: hit?.textContent.slice(0, 50)};
+    }""")
+    assert measurement["visible"], measurement
 
 
 def next_round(page):
@@ -87,7 +108,23 @@ def run():
         page.get_by_role("textbox", name="計画・本人の意思担当の名前", exact=True).fill("ゆう")
         page.get_by_role("button", name="このチームで、夢を応援する →").click()
         expect(page.locator(".game-topbar")).to_contain_text("ブラウザー検証班")
-        expect(page.locator(".discussion-prompts")).to_contain_text("計画・本人の意思担当 · ゆう")
+        for label in ["歩み", "活動", "チーム", "目標", "計画"]:
+            expect(page.get_by_role("button", name=label, exact=True)).to_be_visible()
+        show_tab(page, "チーム")
+        expect(page.locator(".ls-content .discussion-prompts")).to_contain_text("計画・本人の意思担当 · ゆう")
+        show_tab(page, "目標")
+        expect(page.locator(".ls-content .ls-stage-grid")).to_be_visible()
+        show_tab(page, "計画")
+        expect(page.locator(".ls-content .ls-plan")).to_be_visible()
+        show_tab(page, "歩み")
+        expect(page.locator(".ls-journal")).to_be_visible()
+        expect(page.get_by_role("button", name="支援を選ぶ →", exact=True)).to_be_visible()
+        assert saved(page)["current"]["players"] == 5
+        expect(page.get_by_role("button", name="年齢を進める", exact=True)).to_have_count(0)
+        for width in [1440, 820, 390]:
+            assert_layout(page, "journal", width)
+        page.set_viewport_size({"width": 1440, "height": 1100})
+        show_tab(page, "活動")
         expect(action(page, "final")).to_be_disabled()
         expect(action(page, "practice")).to_be_disabled()
         confirm = page.get_by_role("button", name="この計画を実行する →", exact=True)
@@ -101,12 +138,29 @@ def run():
         expect(action(page, "consult")).to_contain_text("人とのつながり +15")
         for width in [1440, 820, 390]:
             assert_layout(page, "game", width)
+        # Navigation and selection also need to work with the mobile dock visible.
+        show_tab(page, "計画")
+        expect(page.locator(".ls-content .ls-plan")).to_be_visible()
+        assert_layout(page, "plan", 390)
+        show_tab(page, "チーム")
+        expect(page.locator(".ls-content .discussion-prompts")).to_be_visible()
+        show_tab(page, "活動")
+        action(page, "study").click()
+        action(page, "study").click()
+        assert saved(page)["current"]["selectedActionIds"] == []
+        assert_uncovered(action(page, "final"))
+        assert_uncovered(page.get_by_role("button", name="この端末の記録を消去", exact=True))
+        page.get_by_role("button", name="この端末の記録を消去", exact=True).click()
+        expect(page.get_by_role("dialog")).to_be_visible()
+        page.get_by_role("button", name="消去せずに戻る", exact=True).click()
+        assert saved(page)["current"]["round"] == 1
         page.set_viewport_size({"width": 1440, "height": 1100})
 
         early_state = None
         for index, actions in enumerate(PATH):
             round_number = index + 1
             expect(page.locator(".round-indicator strong")).to_have_text(str(round_number))
+            show_tab(page, "活動")
             for action_id in actions:
                 expect(action(page, action_id)).to_be_enabled()
                 action(page, action_id).click()
@@ -115,6 +169,7 @@ def run():
                 before_refresh = saved(page)
                 page.reload(wait_until="networkidle")
                 assert saved(page) == before_refresh
+                show_tab(page, "活動")
                 for action_id in actions:
                     expect(action(page, action_id)).to_have_attribute("aria-pressed", "true")
             if round_number == 3:
@@ -127,12 +182,13 @@ def run():
                 expect(page.locator(".budget-row").first).to_contain_text("6 / 6")
                 action(page, "study").click()
                 expect(confirm).to_be_disabled()
-                expect(page.locator(".validation-message")).to_contain_text("時間が2点足りません")
+                expect(page.locator(".ls-plan-validation")).to_contain_text("時間が2点足りません")
                 action(page, "study").click()
                 expect(confirm).to_be_enabled()
             if round_number == 4:
                 expect(action(page, "improve")).to_contain_text("時間 1")
             expect(confirm).to_be_enabled()
+            confirm.click(trial=True)
             # Two immediate DOM clicks exercise React's queued state updates.
             confirm.evaluate("button => { button.click(); button.click(); }")
             expect(page.locator(".result-banner") if round_number < 6 else page.locator(".results-hero")).to_be_visible()
@@ -142,6 +198,8 @@ def run():
             if round_number == 1:
                 assert state["current"]["stats"]["money"] == 80
                 assert state["current"]["stats"]["support"] == 35
+                expect(page.locator(".ls-journal")).to_contain_text("学習・練習")
+                expect(page.locator(".ls-journal")).to_contain_text("地域のニーズを調べる")
                 after_refresh = state
                 page.reload(wait_until="networkidle")
                 assert saved(page) == after_refresh
@@ -174,7 +232,10 @@ def run():
         early_page.goto(URL, wait_until="networkidle")
         early_page.evaluate("([key, state]) => localStorage.setItem(key, JSON.stringify(state))", [KEY, early_state])
         early_page.reload(wait_until="networkidle")
-        early_page.get_by_role("button", name="夢を達成したので、ここで振り返る", exact=True).click()
+        assert_layout(early_page, "round-five-result", 390)
+        early_end = early_page.get_by_role("button", name="夢を達成したので、ここで振り返る", exact=True)
+        assert_uncovered(early_end)
+        early_end.click()
         expect(early_page.locator(".results-hero h1")).to_have_text("夢の実現")
         assert saved(early_page)["current"]["round"] == 5
         assert len(saved(early_page)["results"]) == 1
@@ -211,7 +272,7 @@ def run():
         assert not errors, errors
         context.close()
         browser.close()
-        print(json.dumps({"status": "passed", "flow": "cafe six rounds + early ending + save/restore + compare/reset/clear", "layouts": "start/game/results × desktop1440/tablet820/mobile390", "console_errors": errors, "screenshots": str(ARTIFACTS)}, ensure_ascii=False))
+        print(json.dumps({"status": "passed", "flow": "five functional tabs + cafe six rounds + early ending + save/restore + compare/reset/clear", "layouts": "start/journal/activities/results × desktop1440/tablet820/mobile390", "console_errors": errors, "screenshots": str(ARTIFACTS)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
